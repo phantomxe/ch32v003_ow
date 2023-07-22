@@ -21,7 +21,7 @@ volatile uint8_t scratchpad[10] = {0x89, 0x01, 0x4B, 0x46, 0x7F, 0xFF, 0x0C, 0x1
 typedef enum  {
   WAIT_FOR_RESET,
   ROM_CMD,
-  FUNCTION_CMD,
+  WRITE_MODE,
 } state_t;
 
 volatile state_t current_state = WAIT_FOR_RESET;  
@@ -33,108 +33,108 @@ volatile uint8_t write_mode = 0, write_waiting_bytes = 0, write_current_byte= 0,
 void adc_init( void );
 uint8_t read_bit (uint8_t);
 uint8_t read_byte (void); 
-void EXTI7_0_IRQHandler( void ) __attribute__((interrupt)); // __attribute__((section(".srodata")));
+void EXTI7_0_IRQHandler( void ) __attribute__((interrupt)) __attribute__((section(".srodata")));
  
 void EXTI7_0_IRQHandler( void ) 
 {         
-  //asm volatile( "" : : : "memory" );
- 
-  if(write_mode == 1) {  
-    GPIO_digitalWrite(GPIO_port_C, 4, high); 
+  asm volatile( "" : : : "memory" );
 
-    if(write_waiting_bit_size == 0) {
-      write_waiting_bit_size = 8; 
-      write_current_byte = scratchpad[write_waiting_bytes]; 
-    }
+  switch(current_state) {
+    case WAIT_FOR_RESET:
+      if(ONEWIRE_PIN_READ()) { 
+        int32_t pulse_width = (int32_t)(SysTick->CNT - falling) / 48;
+        if(pulse_width < -1000 || pulse_width > 1000) { 
+          EXTI->INTFR = 1<<1;
+          return;
+        }
+        
+        if(pulse_width > 480) {
+          // this is a reset pulse
+          // send presence pulse 
+          Delay_Us(30);
+          ONEWIRE_PIN_DRIVE_LOW();
+          Delay_Us(65);
+          ONEWIRE_PIN_RELEASE();
+          Delay_Us(370);   
 
-    GPIO_digitalWrite(GPIO_port_C, 2, high);  //for debugging
-
-    if(write_current_byte & 0x01) { 
-      Delay_Us(40);
-    } else {  
-      ONEWIRE_PIN_DRIVE_LOW();
-      Delay_Us(15);
-      ONEWIRE_PIN_RELEASE(); 
-    } 
-
-    GPIO_digitalWrite(GPIO_port_C, 2, low); //for debugging 
-
-    write_current_byte >>= 1;
-    write_waiting_bit_size--;   
-
-    if(write_waiting_bit_size == 0) {
-      write_waiting_bytes++; 
-    }
-
-    entering_time = SysTick->CNT;
-
-    if(write_waiting_bit_size == 0 && write_waiting_bytes >= 9) {
-      GPIO_digitalWrite(GPIO_port_C, 4, low);  // For debugging
-      write_waiting_bytes = 0; 
-      write_current_byte = 0;
-      write_waiting_bit_size = 8;
-      write_mode = 0;
-      EXTI->FTENR = 1<<(1); 
-      EXTI->INTFR = 1<<1; 
-      return;
-    }
-
-    EXTI->INTFR = 1<<1;
-    return; 
-  } else {
-    GPIO_digitalWrite(GPIO_port_C, 4, low);  // For debugging
-  }
-
-
-  if(current_state == WAIT_FOR_RESET) {
-    if(ONEWIRE_PIN_READ()) { 
-      int32_t pulse_width = (int32_t)(SysTick->CNT - falling) / 48;
-      if(pulse_width < -1000 || pulse_width > 1000) { 
-        EXTI->INTFR = 1<<1;
-        return;
+          current_state = ROM_CMD;   
+        }   
+      } else {
+        falling = SysTick->CNT; 
       }
-      
-      if(pulse_width > 480) {
-        // this is a reset pulse
-        // send presence pulse 
-        Delay_Us(30);
-        ONEWIRE_PIN_DRIVE_LOW();
-        Delay_Us(65);
-        ONEWIRE_PIN_RELEASE();
-        Delay_Us(370);   
 
-        current_state = ROM_CMD;  
-      }   
-    } else {
-      falling = SysTick->CNT; 
-    }
-  } else if(current_state == ROM_CMD) {   
-    buffer = read_byte();    
-    Delay_Us(2);
+      GPIO_digitalWrite(GPIO_port_C, 4, low);  // For debugging 
+      break;
+    case ROM_CMD:
+      buffer = read_byte();     
+      Delay_Us(2); 
 
-    if(buffer == 0xcc) { 
-      buffer = read_byte();   
+      if(buffer == 0xcc) { 
+        buffer = read_byte();  
 
-      if(buffer == 0x44) {  
+        if(buffer == 0x44) {   
+          /*
+            I just want to send ADC data over scratchpad but it's not working.
+            so I'm not going to do temperature conversion at now, because I don't want to consume more time.
+          */
+          scratchpad[0] = (uint8_t)(adc_buffer[0] & 0xFF); // FIXME not working
+          scratchpad[1] = (uint8_t)((adc_buffer[0] >> 8) & 0xFF);   
+          scratchpad[2] = 0x31; // for debugging
 
-        scratchpad[0] = (uint8_t)(adc_buffer[0] & 0xFF); // Not working sometimes
-        scratchpad[1] = (uint8_t)((adc_buffer[0] >> 8) & 0xFF);  
-
-        scratchpad[2] = 0x31; // for debugging
-
-        current_state = WAIT_FOR_RESET; 
-      } else if(buffer == 0xbe) { 
-        write_mode = 1;
-        write_current_byte = scratchpad[0];
-        entering_time = SysTick->CNT;
-        EXTI->FTENR = 0;
-        current_state = WAIT_FOR_RESET; 
+          current_state = WAIT_FOR_RESET; 
+        } else if(buffer == 0xbe) {  
+          write_current_byte = scratchpad[0]; 
+          entering_time = SysTick->CNT;
+          EXTI->FTENR = 0;
+          current_state = WRITE_MODE; 
+        } 
+      } else {
+        current_state = WAIT_FOR_RESET;
       } 
-    } else {
-      current_state = WAIT_FOR_RESET;
-    } 
-  }  
+      break;
+    case WRITE_MODE:
+      GPIO_digitalWrite(GPIO_port_C, 4, high); 
 
+      if(write_waiting_bit_size == 0) {
+        write_waiting_bit_size = 8; 
+        write_current_byte = scratchpad[write_waiting_bytes]; 
+      }
+
+      GPIO_digitalWrite(GPIO_port_C, 2, high);  //for debugging
+
+      if(write_current_byte & 0x01) { 
+        Delay_Us(40);
+      } else {  
+        ONEWIRE_PIN_DRIVE_LOW();
+        Delay_Us(15);
+        ONEWIRE_PIN_RELEASE(); 
+      } 
+
+      GPIO_digitalWrite(GPIO_port_C, 2, low); //for debugging 
+
+      write_current_byte >>= 1;
+      write_waiting_bit_size--;   
+
+      if(write_waiting_bit_size == 0) {
+        write_waiting_bytes++; 
+      }
+
+      entering_time = SysTick->CNT;
+
+      if(write_waiting_bit_size == 0 && write_waiting_bytes >= 9) {
+        GPIO_digitalWrite(GPIO_port_C, 4, low);  // For debugging
+        write_waiting_bytes = 0; 
+        write_current_byte = 0;
+        write_waiting_bit_size = 8;
+        current_state = WAIT_FOR_RESET;
+        EXTI->FTENR = 1<<(1); 
+        break;
+      } 
+      break;
+    default:
+      break;
+  }
+ 
   EXTI->INTFR = 1<<1; 
 } 
 
@@ -180,8 +180,8 @@ void adc_init( void )
 { 
   // ADCCLK = 24 MHz => RCC_ADCPRE = 0: divide by 2
 	RCC->CFGR0 &= ~(0x1F<<11);
-	// PD6 is analog input chl 6
-	GPIOD->CFGLR &= ~(0xf<<(4*6));	// CNF = 00: Analog, MODE = 00: Input 
+	// PC4 is analog input chl 2
+	GPIOC->CFGLR &= ~(0xf<<(4*4));	// CNF = 00: Analog, MODE = 00: Input 
 	
 	// Reset the ADC to init all regs
 	RCC->APB2PRSTR |= RCC_APB2Periph_ADC1;
@@ -190,10 +190,10 @@ void adc_init( void )
 	// Set up four conversions on chl 7, 4, 3, 2
 	ADC1->RSQR1 = 0;
 	ADC1->RSQR2 = 0;
-	ADC1->RSQR3 = GPIO_Ain6_D6;
+	ADC1->RSQR3 = GPIO_Ain2_C4;
 	
 	//ADC1->SAMPTR2 &= ~(ADC_SMP0<<(3*6));
-	ADC1->SAMPTR2 |= 7<<(3*6);	// 0:7 => 3/9/15/30/43/57/73/241 cycles
+	ADC1->SAMPTR2 |= 7<<(3*2);	// 0:7 => 3/9/15/30/43/57/73/241 cycles
 
 	// turn on ADC
 	ADC1->CTLR2 |= ADC_ADON;
@@ -215,7 +215,7 @@ void adc_init( void )
 	DMA1_Channel1->CNTR  = ADC_NUMCHLS;
 	DMA1_Channel1->CFGR  =
 		DMA_M2M_Disable |		 
-		DMA_Priority_VeryHigh |
+		DMA_Priority_High |
 		DMA_MemoryDataSize_HalfWord |
 		DMA_PeripheralDataSize_HalfWord |
 		DMA_MemoryInc_Enable |
@@ -234,20 +234,22 @@ void adc_init( void )
 	// start conversion
 	ADC1->CTLR2 |= ADC_SWSTART;
 
-    printf("ADC init done\r\n");
+  //printf("ADC init done\r\n");
 } 
 
+uint32_t last_time = 0;
 
 int main()
 { 
     SystemInit48HSI();
-    SetupDebugPrintf();
+    //SetupDebugPrintf();
+    //SetupUART( UART_BRR );
 
     SETUP_SYSTICK_HCLK
 
     Delay_Ms( 100 );   
 
-    printf("ow-slave adc demo\r\n"); 
+    //printf("ow-slave adc demo\r\n"); 
 
     RCC->APB2PCENR = RCC_APB2Periph_GPIOD | RCC_APB2Periph_GPIOC | RCC_APB2Periph_AFIO | RCC_APB2Periph_ADC1; 
 
@@ -258,9 +260,7 @@ int main()
     EXTI->RTENR  = 1<<(1); // EXT1 Rising edge trigger
     EXTI->FTENR  = 1<<(1); // EXT1 Falling edge trigger
 
-    ONEWIRE_PIN_RELEASE();
-
-    GPIO_portEnable(GPIO_port_C);
+    ONEWIRE_PIN_RELEASE(); 
     
     // For debugging
     GPIO_pinMode(GPIO_port_C, 2, GPIO_pinMode_O_pushPull, GPIO_Speed_10MHz);
@@ -270,18 +270,19 @@ int main()
  
     asm volatile("addi t1, x0, 0\ncsrrw x0, 0x804, t1\n" : : : "t1");
 
-    NVIC_EnableIRQ( EXTI7_0_IRQn )  
+    NVIC_EnableIRQ( EXTI7_0_IRQn ); 
 
+    while(1) { __NOP(); }
+
+/* Not working
     while(1) {     
-        //onewire write mode timeout
-        if(write_mode == 1 && (int32_t)(SysTick->CNT - entering_time) > 480000 ) {   
+        //onewire write mode timeout 
+        if(current_state == WRITE_MODE && (int32_t)(SysTick->CNT - entering_time) > 480000 ) {   
           write_waiting_bytes = 0;
           write_current_byte = 0;
           write_waiting_bit_size = 8;
-          write_mode = 0; 
-          EXTI->FTENR = 1<<(1);  
-          EXTI->INTFR = 1<<1;
-          return;
+          current_state = WAIT_FOR_RESET;
+          EXTI->FTENR = 1<<(1);    
         }    
-    }
+    }*/
 }
