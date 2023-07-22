@@ -1,0 +1,6 @@
+*.elf
+*.hex
+*.hex
+*.lst
+*.map
+*.bin
